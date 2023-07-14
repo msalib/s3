@@ -6,10 +6,15 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Error, Result};
-use aws_sdk_s3::{primitives::ByteStream, Client};
+use aws_sdk_s3::{
+    primitives::ByteStream,
+    types::{Delete, RequestPayer::Requester},
+    Client,
+};
 use bat::{Input, PrettyPrinter};
 use futures::{stream::TryStreamExt, StreamExt};
 use humansize::{format_size, DECIMAL};
+use once_cell::sync::OnceCell;
 use structopt::StructOpt;
 use tokio::io::{AsyncRead, BufReader};
 use tokio_util::io::SyncIoBridge;
@@ -45,6 +50,15 @@ impl S3Path {
     fn maybe_key(&self) -> Option<&str> {
         self.inner.path().strip_prefix('/')
     }
+
+    fn join(self, tail: &str) -> Result<Self> {
+        let mut s = String::from(self.inner);
+        if !s.ends_with('/') {
+            s.push('/');
+        }
+        s.push_str(tail);
+        S3Path::from_str(&s)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +75,27 @@ impl FromStr for LocalOrRemote {
             Ok(remote) => LocalOrRemote::Remote(remote),
             Err(_) => LocalOrRemote::Local(PathBuf::from(s)),
         })
+    }
+}
+
+impl LocalOrRemote {
+    fn file_name(&self) -> Option<String> {
+        match self {
+            LocalOrRemote::Local(local) => local
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            LocalOrRemote::Remote(path) => match path.key().rsplit_once('/') {
+                Some((_, last)) if last != "" => Some(last.to_owned()),
+                _ => None,
+            },
+        }
+    }
+
+    fn is_dir(&self) -> bool {
+        match self {
+            LocalOrRemote::Local(local) => local.is_dir(),
+            LocalOrRemote::Remote(remote) => remote.key().ends_with('/'),
+        }
     }
 }
 
@@ -107,27 +142,36 @@ enum CatContents<T: AsyncRead> {
     Reader(SyncIoBridge<BufReader<T>>),
 }
 
-async fn region_name(client: &Client, bucket: &str) -> Result<String> {
-    Ok(client
-        .get_bucket_location()
-        .bucket(bucket)
-        .send()
-        .await?
-        .location_constraint()
-        .map(|region| region.as_str())
-        .unwrap_or("us-east-1")
-        .to_owned())
+static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| -> reqwest::Client { reqwest::Client::new() })
 }
 
-async fn region_client(client: &Client, path: &S3Path) -> Result<Option<Client>> {
-    let region_name = region_name(client, path.bucket()).await?;
-    Ok(if region_name != "" {
-        let region = aws_types::region::Region::new(region_name);
-        let config = aws_config::from_env().region(region).load().await;
-        Some(Client::new(&config))
-    } else {
-        None
-    })
+async fn region_name(bucket: &str) -> Result<String> {
+    // I tried `get_bucket_location` -- that fails for request-payer
+    // buckets that we don't own like `sentinel-cogs`. The docs
+    // suggested it was deprecated in favor of `head_bucket` so I
+    // tried that, but that one returns a struct with no accessible
+    // data.
+    let url = format!("https://{}.s3.amazonaws.com", &bucket);
+    // This request will return 403, but will still have the region
+    // header!
+    let response = http_client().head(url).send().await?;
+    let region_header = response.headers().get("x-amz-bucket-region");
+    match region_header {
+        Some(region) => Ok(region.to_str()?.to_owned()),
+        None => {
+            bail!("no region header found for bucket: {}", &bucket);
+        }
+    }
+}
+
+async fn region_client(path: &S3Path) -> Result<Client> {
+    let region_name = region_name(path.bucket()).await?;
+    let region = aws_types::region::Region::new(region_name);
+    let config = aws_config::from_env().region(region).load().await;
+    Ok(Client::new(&config))
 }
 
 const PARALLELISM: usize = 16;
@@ -136,24 +180,20 @@ const PARALLELISM: usize = 16;
 async fn main() -> Result<()> {
     let cli = Commands::from_args();
 
-    let config = aws_config::load_from_env().await;
-    let mut client = Client::new(&config);
-
     match cli {
         Commands::Cat {
             pretty_print,
             paths,
         } => {
             for path in paths.into_iter() {
-                if let Some(region_client) = region_client(&client, &path).await? {
-                    client = region_client;
-                }
+                let client = region_client(&path).await?;
 
                 let key = path.key().to_owned();
                 let resp = client
                     .get_object()
                     .bucket(path.bucket())
                     .key(&key)
+                    .request_payer(Requester)
                     .send()
                     .await?;
                 let body = resp.body;
@@ -191,9 +231,7 @@ async fn main() -> Result<()> {
             recursive,
             path,
         } => {
-            if let Some(region_client) = region_client(&client, &path).await? {
-                client = region_client;
-            }
+            let client = region_client(&path).await?;
 
             let prefix = path.maybe_key().map(String::from);
             let delimiter = if recursive {
@@ -206,8 +244,10 @@ async fn main() -> Result<()> {
                 .bucket(path.bucket())
                 .set_prefix(prefix.clone())
                 .set_delimiter(delimiter)
+                .request_payer(Requester)
                 .into_paginator()
                 .send();
+
             while let Some(item) = stream.try_next().await? {
                 if let Some(prefixes) = item.common_prefixes() {
                     for key in prefixes {
@@ -246,7 +286,7 @@ async fn main() -> Result<()> {
         Commands::Rm { paths } => {
             let buckets: HashSet<&str> = paths.iter().map(|path| path.bucket()).collect();
             let regions: HashMap<String, String> = futures::stream::iter(buckets.iter())
-                .map(|x| bucket_region_pair(&client, x))
+                .map(|x| bucket_region_pair(x))
                 .boxed()
                 .buffered(PARALLELISM)
                 .try_collect()
@@ -265,21 +305,18 @@ async fn main() -> Result<()> {
             }
 
             futures::stream::iter(region_paths.into_values().map(Ok))
-                .try_for_each_concurrent(PARALLELISM, |bucket_paths| {
-                    rm_one_region(client.clone(), bucket_paths)
-                })
+                .try_for_each_concurrent(PARALLELISM, |bucket_paths| rm_one_region(bucket_paths))
                 .await?;
         }
 
         Commands::Touch { destination } => {
-            if let Some(region_client) = region_client(&client, &destination).await? {
-                client = region_client;
-            }
+            let client = region_client(&destination).await?;
             client
                 .put_object()
                 .bucket(destination.bucket())
                 .key(destination.key())
                 .body(ByteStream::from(vec![]))
+                .request_payer(Requester)
                 .send()
                 .await?;
         }
@@ -288,7 +325,21 @@ async fn main() -> Result<()> {
             source,
             destination,
         } => {
+            ensure!(
+                source.file_name().is_some(),
+                "cannot copy to destination directory since source has no file name"
+            );
+            let source_file = source.file_name().unwrap();
             use LocalOrRemote::*;
+            let destination = if destination.is_dir() {
+                match destination {
+                    Local(local) => Local(local.join(source_file)),
+                    Remote(remote) => Remote(remote.join(&source_file)?),
+                }
+            } else {
+                destination
+            };
+
             match (source, destination) {
                 (Local(source), Local(destination)) => {
                     // just a local copy
@@ -297,27 +348,25 @@ async fn main() -> Result<()> {
 
                 (Local(source), Remote(destination)) => {
                     // upload
-                    if let Some(region_client) = region_client(&client, &destination).await? {
-                        client = region_client;
-                    }
+                    let client = region_client(&destination).await?;
                     client
                         .put_object()
                         .bucket(destination.bucket())
                         .key(destination.key())
                         .body(ByteStream::from_path(source).await?)
+                        .request_payer(Requester)
                         .send()
                         .await?;
                 }
 
                 (Remote(source), Local(destination)) => {
                     // download
-                    if let Some(region_client) = region_client(&client, &source).await? {
-                        client = region_client;
-                    }
+                    let client = region_client(&source).await?;
                     let response = client
                         .get_object()
                         .bucket(source.bucket())
                         .key(source.key())
+                        .request_payer(Requester)
                         .send()
                         .await?;
                     let mut input = response.body.into_async_read();
@@ -327,15 +376,14 @@ async fn main() -> Result<()> {
 
                 (Remote(source), Remote(destination)) => {
                     // direct AWS copy
-                    if let Some(region_client) = region_client(&client, &destination).await? {
-                        client = region_client;
-                    }
+                    let client = region_client(&destination).await?;
 
                     let _x = client
                         .copy_object()
                         .bucket(destination.bucket())
                         .key(destination.key())
                         .copy_source(format!("{}/{}", source.bucket(), source.key()))
+                        .request_payer(Requester)
                         .send()
                         .await?;
                     // FIXME: verify that copy worked
@@ -346,14 +394,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn bucket_region_pair(client: &Client, bucket: &str) -> Result<(String, String)> {
-    Ok((bucket.to_owned(), region_name(client, bucket).await?))
+async fn bucket_region_pair(bucket: &str) -> Result<(String, String)> {
+    Ok((bucket.to_owned(), region_name(bucket).await?))
 }
 
-async fn rm_one_region(mut client: Client, paths: HashMap<String, Vec<S3Path>>) -> Result<()> {
-    if let Some(region_client) = region_client(&client, &paths.values().next().unwrap()[0]).await? {
-        client = region_client;
-    }
+async fn rm_one_region(paths: HashMap<String, Vec<S3Path>>) -> Result<()> {
+    let client = region_client(&paths.values().next().unwrap()[0]).await?;
 
     for (bucket, paths) in paths.into_iter() {
         let oids: Vec<_> = paths
@@ -364,12 +410,11 @@ async fn rm_one_region(mut client: Client, paths: HashMap<String, Vec<S3Path>>) 
                     .build()
             })
             .collect();
-        let delete = aws_sdk_s3::types::Delete::builder()
-            .set_objects(Some(oids))
-            .build();
+        let delete = Delete::builder().set_objects(Some(oids)).build();
         let response = client
             .delete_objects()
             .bucket(bucket.clone())
+            .request_payer(Requester)
             .delete(delete)
             .send()
             .await?;
